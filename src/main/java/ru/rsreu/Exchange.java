@@ -4,7 +4,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-public final class Exchange {
+public final class Exchange implements MatchingEngine {
 
     private final Map<CurrencyPair, OrderBook> books = new ConcurrentHashMap<>();
     private final Map<String, ClientCallback> callbacks = new ConcurrentHashMap<>();
@@ -35,6 +35,7 @@ public final class Exchange {
         return book;
     }
 
+    @Override
     public void registerClient(String clientId, ClientCallback callback) {
         callbacks.put(clientId, callback);
     }
@@ -42,6 +43,7 @@ public final class Exchange {
     /**
      * Создание ордера. Вся обработка (matching) происходит синхронно в потоке вызывающего кода.
      */
+    @Override
     public long placeOrder(OrderRequest request, ClientCallback callback) {
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(callback, "callback");
@@ -100,6 +102,7 @@ public final class Exchange {
     /**
      * Отмена ордера по orderId.
      */
+    @Override
     public void cancelOrder(long orderId, String clientId, ClientCallback callback) {
         Objects.requireNonNull(clientId, "clientId");
         Objects.requireNonNull(callback, "callback");
@@ -288,6 +291,7 @@ public final class Exchange {
      * Полный снимок состояния биржи.
      * Предполагается вызывать, когда активных операций нет (после теста).
      */
+    @Override
     public ExchangeSnapshot snapshot() {
         Map<CurrencyPair, OrderBookSnapshot> bookSnapshots = new HashMap<>();
 
