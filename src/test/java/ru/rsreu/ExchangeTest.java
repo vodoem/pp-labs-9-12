@@ -3,7 +3,6 @@ package ru.rsreu;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
-
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -12,7 +11,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -37,8 +35,10 @@ class ExchangeTest {
             TestClient buyer = new TestClient("buyer");
             TestClient seller = new TestClient("seller");
 
-            exchange.registerClient(buyer.getClientId(), buyer);
-            exchange.registerClient(seller.getClientId(), seller);
+            exchange.registerClient(buyer.getClientId()).block();
+            exchange.registerClient(seller.getClientId()).block();
+            buyer.subscribe(exchange.events(buyer.getClientId()));
+            seller.subscribe(exchange.events(seller.getClientId()));
 
             exchange.placeOrder(new OrderRequest(
                             buyer.getClientId(),
@@ -46,8 +46,8 @@ class ExchangeTest {
                             Side.BUY,
                             10,
                             100
-                    ),
-                    buyer);
+                    )
+            ).block();
 
             exchange.placeOrder(new OrderRequest(
                             seller.getClientId(),
@@ -55,10 +55,10 @@ class ExchangeTest {
                             Side.SELL,
                             10,
                             95
-                    ),
-                    seller);
+                    )
+            ).block();
 
-            ExchangeSnapshot snapshot = exchange.snapshot();
+            ExchangeSnapshot snapshot = exchange.snapshot().block();
             OrderBookSnapshot bookSnapshot = snapshot.getBooks().get(PAIR);
 
             assertNotNull(bookSnapshot);
@@ -93,8 +93,10 @@ class ExchangeTest {
             TestClient buyer = new TestClient("partial-buyer");
             TestClient seller = new TestClient("partial-seller");
 
-            exchange.registerClient(buyer.getClientId(), buyer);
-            exchange.registerClient(seller.getClientId(), seller);
+            exchange.registerClient(buyer.getClientId()).block();
+            exchange.registerClient(seller.getClientId()).block();
+            buyer.subscribe(exchange.events(buyer.getClientId()));
+            seller.subscribe(exchange.events(seller.getClientId()));
 
             exchange.placeOrder(new OrderRequest(
                             buyer.getClientId(),
@@ -102,8 +104,8 @@ class ExchangeTest {
                             Side.BUY,
                             10,
                             100
-                    ),
-                    buyer);
+                    )
+            ).block();
 
             exchange.placeOrder(new OrderRequest(
                             seller.getClientId(),
@@ -111,10 +113,10 @@ class ExchangeTest {
                             Side.SELL,
                             5,
                             95
-                    ),
-                    seller);
+                    )
+            ).block();
 
-            ExchangeSnapshot snapshot = exchange.snapshot();
+            ExchangeSnapshot snapshot = exchange.snapshot().block();
             OrderBookSnapshot bookSnapshot = snapshot.getBooks().get(PAIR);
 
             assertNotNull(bookSnapshot);
@@ -147,15 +149,16 @@ class ExchangeTest {
             ExecutorService executor = Executors.newFixedThreadPool(threads);
             CountDownLatch latch = new CountDownLatch(threads);
 
-            List<Future<?>> futures = new ArrayList<>();
+            List<Runnable> registrations = new ArrayList<>();
 
             for (int i = 0; i < threads; i++) {
                 final int idx = i;
-                Future<?> future = executor.submit(() -> {
+                registrations.add(() -> {
                     String clientId = "U" + idx;
                     TestClient client = new TestClient(clientId);
                     clients.put(clientId, client);
-                    exchange.registerClient(clientId, client);
+                    exchange.registerClient(clientId).block();
+                    client.subscribe(exchange.events(clientId));
 
                     for (int j = 0; j < ordersPerThread; j++) {
                         Side side = (j % 2 == 0) ? Side.BUY : Side.SELL;
@@ -166,18 +169,18 @@ class ExchangeTest {
                                         side,
                                         5,
                                         price
-                                ),
-                                client);
+                                )
+                        ).block();
                     }
                     latch.countDown();
                 });
-                futures.add(future);
+            }
+
+            for (Runnable task : registrations) {
+                executor.submit(task);
             }
 
             latch.await(5, TimeUnit.SECONDS);
-            for (Future<?> future : futures) {
-                future.get(1, TimeUnit.SECONDS);
-            }
             executor.shutdown();
 
             List<OrderEvent> allEvents = clients.values().stream()
@@ -189,7 +192,7 @@ class ExchangeTest {
             assertEquals(0L, balanceChanges.getOrDefault(Currency.USD, 0L), "USD balance should stay constant");
             assertEquals(0L, balanceChanges.getOrDefault(Currency.RUB, 0L), "RUB balance should stay constant");
 
-            ExchangeSnapshot snapshot = exchange.snapshot();
+            ExchangeSnapshot snapshot = exchange.snapshot().block();
             assertFalse(snapshot.getTrades().isEmpty(), "stress test should produce trades");
         }
     }
@@ -233,8 +236,10 @@ class ExchangeTest {
         try (MatchingEngine exchange = factory.get()) {
             TestClient buyer = new TestClient("perf-buyer");
             TestClient seller = new TestClient("perf-seller");
-            exchange.registerClient(buyer.getClientId(), buyer);
-            exchange.registerClient(seller.getClientId(), seller);
+            exchange.registerClient(buyer.getClientId()).block();
+            exchange.registerClient(seller.getClientId()).block();
+            buyer.subscribe(exchange.events(buyer.getClientId()));
+            seller.subscribe(exchange.events(seller.getClientId()));
 
             for (int i = 0; i < totalOrders; i++) {
                 Side side = (i % 2 == 0) ? Side.BUY : Side.SELL;
@@ -245,11 +250,11 @@ class ExchangeTest {
                                 side,
                                 1,
                                 side == Side.BUY ? 101 : 99
-                        ),
-                        client);
+                        )
+                ).block();
             }
 
-            exchange.snapshot();
+            exchange.snapshot().block();
         } catch (Exception e) {
             throw new RuntimeException(e);
         }

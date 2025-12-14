@@ -8,19 +8,18 @@ import java.util.concurrent.Executors;
 public class Main {
     public static void main(String[] args) throws Exception {
 
-        // 1. Создаём биржу
         Exchange exchange = new Exchange(
                 List.of(new CurrencyPair(Currency.USD, Currency.RUB))
         );
 
-        // 2. Регистрируем клиентов
         TestClient alice = new TestClient("alice");
         TestClient bob = new TestClient("bob");
 
-        exchange.registerClient("alice", alice);
-        exchange.registerClient("bob", bob);
+        exchange.registerClient("alice").block();
+        exchange.registerClient("bob").block();
+        alice.subscribe(exchange.events("alice"));
+        bob.subscribe(exchange.events("bob"));
 
-        // 3. Отправляем ордера
         System.out.println("=== Размещение ордеров ===");
 
         exchange.placeOrder(
@@ -29,9 +28,8 @@ public class Main {
                         Side.BUY,
                         100,
                         80
-                ),
-                alice
-        );
+                )
+        ).block();
 
         exchange.placeOrder(
                 new OrderRequest("bob",
@@ -39,20 +37,17 @@ public class Main {
                         Side.SELL,
                         100,
                         75
-                ),
-                bob
-        );
+                )
+        ).block();
 
-        // 4. Вывод нотификаций
         System.out.println("\n=== Нотификации Alice ===");
         alice.getEvents().forEach(System.out::println);
 
         System.out.println("\n=== Нотификации Bob ===");
         bob.getEvents().forEach(System.out::println);
 
-        // 5. Snapshot биржи
         System.out.println("\n=== Snapshot ===");
-        ExchangeSnapshot snapshot = exchange.snapshot();
+        ExchangeSnapshot snapshot = exchange.snapshot().block();
         snapshot.getBooks().forEach((pair, book) -> {
             System.out.println(pair + ": bids=" + book.getBids().size() +
                     " asks=" + book.getAsks().size());
@@ -60,14 +55,15 @@ public class Main {
 
         snapshot.getTrades().forEach(System.out::println);
 
-        // 6. Стресс-тест
         System.out.println("\n=== Stress Test ===");
         stressTest(exchange);
 
-        // 7. Final snapshot
         System.out.println("\n=== Final snapshot ===");
-        ExchangeSnapshot after = exchange.snapshot();
+        ExchangeSnapshot after = exchange.snapshot().block();
         System.out.println("Trades: " + after.getTrades().size());
+
+        alice.stop();
+        bob.stop();
     }
 
     private static void stressTest(Exchange exchange) throws Exception {
@@ -79,7 +75,9 @@ public class Main {
             final int id = i;
             pool.submit(() -> {
                 String user = "U" + id;
-                exchange.registerClient(user, new TestClient(user));
+                exchange.registerClient(user).block();
+                TestClient client = new TestClient(user);
+                client.subscribe(exchange.events(user));
                 CurrencyPair pair = new CurrencyPair(Currency.USD, Currency.RUB);
 
                 for (int j = 0; j < 50; j++) {
@@ -90,9 +88,8 @@ public class Main {
                                     (j % 2 == 0 ? Side.BUY : Side.SELL),
                                     10,
                                     70 + j % 5
-                            ),
-                            exchange.getCallback(user)
-                    );
+                            )
+                    ).block();
                 }
                 latch.countDown();
             });

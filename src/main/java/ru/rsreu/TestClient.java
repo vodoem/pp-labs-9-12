@@ -1,12 +1,16 @@
 package ru.rsreu;
 
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import reactor.core.Disposable;
+import reactor.core.publisher.Flux;
 
-public class TestClient implements ClientCallback {
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class TestClient {
 
     private final String clientId;
-    private final BlockingQueue<OrderEvent> events = new LinkedBlockingQueue<>();
+    private final List<OrderEvent> events = new CopyOnWriteArrayList<>();
+    private Disposable subscription;
 
     public TestClient(String clientId) {
         this.clientId = clientId;
@@ -16,13 +20,20 @@ public class TestClient implements ClientCallback {
         return clientId;
     }
 
-    @Override
-    public void onEvent(OrderEvent event) {
-        // Сохраняем событие, чтобы потом анализировать в main или в тестах
-        events.add(event);
+    public void subscribe(Flux<OrderEvent> stream) {
+        if (subscription != null && !subscription.isDisposed()) {
+            subscription.dispose();
+        }
+        subscription = stream.subscribe(events::add);
     }
 
-    public BlockingQueue<OrderEvent> getEvents() {
+    public List<OrderEvent> getEvents() {
         return events;
+    }
+
+    public void stop() {
+        if (subscription != null) {
+            subscription.dispose();
+        }
     }
 }
