@@ -1,5 +1,11 @@
 package ru.rsreu;
 
+import com.lmax.disruptor.BlockingWaitStrategy;
+import com.lmax.disruptor.EventHandler;
+import com.lmax.disruptor.RingBuffer;
+import com.lmax.disruptor.dsl.Disruptor;
+import com.lmax.disruptor.dsl.ProducerType;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -7,23 +13,27 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class QueuedExchange implements MatchingEngine {
 
-    private final BlockingQueue<Command<?>> queue = new LinkedBlockingQueue<>();
-    private final Thread workerThread;
+    private final Disruptor<CommandEvent> disruptor;
+    private final RingBuffer<CommandEvent> ringBuffer;
     private final AtomicLong orderIdSeq = new AtomicLong(1L);
 
     public QueuedExchange(Collection<CurrencyPair> supportedPairs) {
         ExchangeState state = new ExchangeState(supportedPairs);
-        ExchangeWorker worker = new ExchangeWorker(queue, state);
-        this.workerThread = new Thread(worker, "exchange-worker");
-        this.workerThread.setDaemon(true);
-        this.workerThread.start();
+        ThreadFactory threadFactory = r -> {
+            Thread thread = new Thread(r, "exchange-worker");
+            thread.setDaemon(true);
+            return thread;
+        };
+        this.disruptor = new Disruptor<>(CommandEvent::new, 1024, threadFactory, ProducerType.MULTI,
+                new BlockingWaitStrategy());
+        this.disruptor.handleEventsWith(new ExchangeEventHandler(state));
+        this.ringBuffer = disruptor.start();
     }
 
     @Override
@@ -62,26 +72,16 @@ public final class QueuedExchange implements MatchingEngine {
     public void close() throws InterruptedException {
         StopCommand stop = new StopCommand();
         enqueueAndWait(stop);
-        workerThread.join(1000);
+        disruptor.shutdown();
     }
 
     private void enqueue(Command<?> command) {
-        try {
-            queue.put(command);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while enqueuing command", e);
-        }
+        ringBuffer.publishEvent((event, sequence) -> event.setCommand(command));
     }
 
     private <T> T enqueueAndWait(Command<T> command) {
-        try {
-            queue.put(command);
-            return command.result().join();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted while enqueuing command", e);
-        }
+        ringBuffer.publishEvent((event, sequence) -> event.setCommand(command));
+        return command.result().join();
     }
 
     private static final class ExchangeState {
@@ -105,35 +105,47 @@ public final class QueuedExchange implements MatchingEngine {
         }
     }
 
-    private static final class ExchangeWorker implements Runnable {
-        private final BlockingQueue<Command<?>> queue;
+    private static final class ExchangeEventHandler implements EventHandler<CommandEvent> {
         private final ExchangeState state;
 
-        ExchangeWorker(BlockingQueue<Command<?>> queue, ExchangeState state) {
-            this.queue = queue;
+        ExchangeEventHandler(ExchangeState state) {
             this.state = state;
         }
 
         @Override
-        public void run() {
-            try {
-                while (true) {
-                    Command<?> command = queue.take();
-                    if (command instanceof StopCommand) {
-                        command.result().complete(null);
-                        break;
-                    }
-                    try {
-                        command.execute(state);
-                    } catch (Exception e) {
-                        command.result().completeExceptionally(e);
-                        continue;
-                    }
-                    command.complete();
-                }
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+        public void onEvent(CommandEvent event, long sequence, boolean endOfBatch) {
+            Command<?> command = event.getCommand();
+            if (command == null) {
+                return;
             }
+            try {
+                if (!(command instanceof StopCommand)) {
+                    command.execute(state);
+                    command.complete();
+                } else {
+                    command.result().complete(null);
+                }
+            } catch (Exception e) {
+                command.result().completeExceptionally(e);
+            } finally {
+                event.clear();
+            }
+        }
+    }
+
+    private static final class CommandEvent {
+        private Command<?> command;
+
+        Command<?> getCommand() {
+            return command;
+        }
+
+        void setCommand(Command<?> command) {
+            this.command = command;
+        }
+
+        void clear() {
+            this.command = null;
         }
     }
 
