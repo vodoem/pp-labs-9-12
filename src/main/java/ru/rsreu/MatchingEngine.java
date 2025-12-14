@@ -1,13 +1,18 @@
 package ru.rsreu;
 
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
 public interface MatchingEngine extends AutoCloseable {
-    void registerClient(String clientId, ClientCallback callback);
+    Mono<Void> registerClient(String clientId);
 
-    long placeOrder(OrderRequest request, ClientCallback callback);
+    Mono<Long> placeOrder(OrderRequest request);
 
-    void cancelOrder(long orderId, String clientId, ClientCallback callback);
+    Mono<Void> cancelOrder(long orderId, String clientId);
 
-    ExchangeSnapshot snapshot();
+    Mono<ExchangeSnapshot> snapshot();
+
+    Flux<OrderEvent> events(String clientId);
 
     @Override
     default void close() throws Exception {

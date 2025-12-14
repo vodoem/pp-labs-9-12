@@ -1,5 +1,9 @@
 package ru.rsreu;
 
+import reactive.collections.ReactiveQueue;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -7,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class Exchange implements MatchingEngine {
 
     private final Map<CurrencyPair, OrderBook> books = new ConcurrentHashMap<>();
-    private final Map<String, ClientCallback> callbacks = new ConcurrentHashMap<>();
+    private final Map<String, ReactiveQueue<OrderEvent>> events = new ConcurrentHashMap<>();
 
     private final AtomicLong orderIdSeq = new AtomicLong(1);
     private final AtomicLong tradeIdSeq = new AtomicLong(1);
@@ -22,11 +26,6 @@ public final class Exchange implements MatchingEngine {
         }
     }
 
-    public ClientCallback getCallback(String clientId) {
-        return callbacks.get(clientId);
-    }
-
-
     private OrderBook getBookOrThrow(CurrencyPair pair) {
         OrderBook book = books.get(pair);
         if (book == null) {
@@ -36,95 +35,113 @@ public final class Exchange implements MatchingEngine {
     }
 
     @Override
-    public void registerClient(String clientId, ClientCallback callback) {
-        callbacks.put(clientId, callback);
+    public Mono<Void> registerClient(String clientId) {
+        return Mono.fromRunnable(() -> events.computeIfAbsent(clientId, id -> new ReactiveQueue<>()));
+    }
+
+    @Override
+    public Flux<OrderEvent> events(String clientId) {
+        ReactiveQueue<OrderEvent> queue = events.get(clientId);
+        return queue == null ? Flux.empty() : queue.flux();
     }
 
     /**
      * Создание ордера. Вся обработка (matching) происходит синхронно в потоке вызывающего кода.
      */
     @Override
-    public long placeOrder(OrderRequest request, ClientCallback callback) {
+    public Mono<Long> placeOrder(OrderRequest request) {
         Objects.requireNonNull(request, "request");
-        Objects.requireNonNull(callback, "callback");
-
         OrderBook book = getBookOrThrow(request.getPair());
-        book.getLock().lock();
-        try {
-            long orderId = orderIdSeq.getAndIncrement();
-            Order order = new Order(orderId, request);
+        return Mono.fromCallable(() -> {
+            book.getLock().lock();
+            try {
+                long orderId = orderIdSeq.getAndIncrement();
+                Order order = new Order(orderId, request);
 
-            // 1. подтверждаем размещение ордера
-            callback.onEvent(new OrderEvent(
-                    orderId,
-                    request.getClientId(),
-                    ExecutionType.ACCEPTED,
-                    request.getPair(),
-                    request.getSide(),
-                    null,
-                    null,
-                    null,
-                    null,
-                    0,
-                    order.getRemainingQuantity()
-            ));
+                emitEvent(request.getClientId(), new OrderEvent(
+                        orderId,
+                        request.getClientId(),
+                        ExecutionType.ACCEPTED,
+                        request.getPair(),
+                        request.getSide(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        0,
+                        order.getRemainingQuantity()
+                ));
 
-            // 2. запускаем matching
-            match(order, book, callback);
+                match(order, book);
 
-            // 3. если ордер ещё не полностью исполнен — добавляем в книгу
-            if (order.getStatus() != OrderStatus.FILLED && order.getStatus() != OrderStatus.CANCELED) {
-                book.addOrderToBook(order);
+                if (order.getStatus() != OrderStatus.FILLED && order.getStatus() != OrderStatus.CANCELED) {
+                    book.addOrderToBook(order);
+                }
+
+                return orderId;
+            } catch (RuntimeException e) {
+                emitEvent(request.getClientId(), new OrderEvent(
+                        -1L,
+                        request.getClientId(),
+                        ExecutionType.REJECTED,
+                        request.getPair(),
+                        request.getSide(),
+                        "Exception: " + e.getMessage(),
+                        null,
+                        null,
+                        null,
+                        0,
+                        request.getQuantity()
+                ));
+                throw e;
+            } finally {
+                book.getLock().unlock();
             }
-
-            return orderId;
-        } catch (RuntimeException e) {
-            // В случае ошибок — REJECTED
-            callback.onEvent(new OrderEvent(
-                    -1L,
-                    request.getClientId(),
-                    ExecutionType.REJECTED,
-                    request.getPair(),
-                    request.getSide(),
-                    "Exception: " + e.getMessage(),
-                    null,
-                    null,
-                    null,
-                    0,
-                    request.getQuantity()
-            ));
-            throw e;
-        } finally {
-            book.getLock().unlock();
-        }
+        });
     }
 
     /**
      * Отмена ордера по orderId.
      */
     @Override
-    public void cancelOrder(long orderId, String clientId, ClientCallback callback) {
+    public Mono<Void> cancelOrder(long orderId, String clientId) {
         Objects.requireNonNull(clientId, "clientId");
-        Objects.requireNonNull(callback, "callback");
+        return Mono.fromRunnable(() -> {
+            for (OrderBook book : books.values()) {
+                book.getLock().lock();
+                try {
+                    Order order = book.getOrdersById().get(orderId);
+                    if (order == null) {
+                        continue;
+                    }
 
-        // ищем ордер по всем книгам
-        for (OrderBook book : books.values()) {
-            book.getLock().lock();
-            try {
-                Order order = book.getOrdersById().get(orderId);
-                if (order == null) {
-                    continue;
-                }
+                    if (order.getStatus() == OrderStatus.FILLED || order.getStatus() == OrderStatus.CANCELED) {
+                        emitEvent(clientId, new OrderEvent(
+                                orderId,
+                                clientId,
+                                ExecutionType.CANCELED,
+                                order.getRequest().getPair(),
+                                order.getRequest().getSide(),
+                                "Already finished",
+                                null,
+                                null,
+                                null,
+                                order.getRequest().getQuantity() - order.getRemainingQuantity(),
+                                order.getRemainingQuantity()
+                        ));
+                        return;
+                    }
 
-                if (order.getStatus() == OrderStatus.FILLED || order.getStatus() == OrderStatus.CANCELED) {
-                    // уже исполнен или отменен — можно просто уведомить, если хочется
-                    callback.onEvent(new OrderEvent(
+                    book.removeOrderFromBook(order);
+                    order.setStatus(OrderStatus.CANCELED);
+
+                    emitEvent(clientId, new OrderEvent(
                             orderId,
                             clientId,
                             ExecutionType.CANCELED,
                             order.getRequest().getPair(),
                             order.getRequest().getSide(),
-                            "Already finished",
+                            "Canceled by client",
                             null,
                             null,
                             null,
@@ -132,52 +149,31 @@ public final class Exchange implements MatchingEngine {
                             order.getRemainingQuantity()
                     ));
                     return;
+                } finally {
+                    book.getLock().unlock();
                 }
-
-                book.removeOrderFromBook(order);
-                order.setStatus(OrderStatus.CANCELED);
-
-                callback.onEvent(new OrderEvent(
-                        orderId,
-                        clientId,
-                        ExecutionType.CANCELED,
-                        order.getRequest().getPair(),
-                        order.getRequest().getSide(),
-                        "Canceled by client",
-                        null,
-                        null,
-                        null,
-                        order.getRequest().getQuantity() - order.getRemainingQuantity(),
-                        order.getRemainingQuantity()
-                ));
-                return;
-            } finally {
-                book.getLock().unlock();
             }
-        }
 
-        // не нашли — можно отправить REJECTED или игнорировать
-        callback.onEvent(new OrderEvent(
-                orderId,
-                clientId,
-                ExecutionType.REJECTED,
-                null,
-                null,
-                "Order not found",
-                null,
-                null,
-                null,
-                0,
-                0
-        ));
+            emitEvent(clientId, new OrderEvent(
+                    orderId,
+                    clientId,
+                    ExecutionType.REJECTED,
+                    null,
+                    null,
+                    "Order not found",
+                    null,
+                    null,
+                    null,
+                    0,
+                    0
+            ));
+        });
     }
 
     /**
      * Matching в рамках одной книги.
      */
-    private void match(Order incoming, OrderBook book, ClientCallback incomingCallback) {
-        PriorityQueue<Order> sameSideQueue =
-                (incoming.getRequest().getSide() == Side.BUY) ? book.getBids() : book.getAsks();
+    private void match(Order incoming, OrderBook book) {
         PriorityQueue<Order> oppositeQueue =
                 (incoming.getRequest().getSide() == Side.BUY) ? book.getAsks() : book.getBids();
 
@@ -228,30 +224,25 @@ public final class Exchange implements MatchingEngine {
                     incoming.getRequest().getQuantity() - incoming.getRemainingQuantity(),
                     incoming.getRemainingQuantity()
             );
-            incomingCallback.onEvent(eventIncoming);
+            emitEvent(incoming.getRequest().getClientId(), eventIncoming);
 
-            ClientCallback counterCb =
-                    callbacks.get(bestOpposite.getRequest().getClientId());
+            OrderEvent eventCounterparty = new OrderEvent(
+                    bestOpposite.getId(),
+                    bestOpposite.getRequest().getClientId(),
+                    bestOpposite.getRemainingQuantity() == 0
+                            ? ExecutionType.FULL_FILL
+                            : ExecutionType.PARTIAL_FILL,
+                    bestOpposite.getRequest().getPair(),
+                    bestOpposite.getRequest().getSide(),
+                    null,
+                    tradePrice,
+                    tradeQty,
+                    incoming.getId(),
+                    bestOpposite.getRequest().getQuantity() - bestOpposite.getRemainingQuantity(),
+                    bestOpposite.getRemainingQuantity()
+            );
 
-            if (counterCb != null) {
-                OrderEvent eventCounterparty = new OrderEvent(
-                        bestOpposite.getId(),
-                        bestOpposite.getRequest().getClientId(),
-                        bestOpposite.getRemainingQuantity() == 0
-                                ? ExecutionType.FULL_FILL
-                                : ExecutionType.PARTIAL_FILL,
-                        bestOpposite.getRequest().getPair(),
-                        bestOpposite.getRequest().getSide(),
-                        null,
-                        tradePrice,
-                        tradeQty,
-                        incoming.getId(),
-                        bestOpposite.getRequest().getQuantity() - bestOpposite.getRemainingQuantity(),
-                        bestOpposite.getRemainingQuantity()
-                );
-
-                counterCb.onEvent(eventCounterparty);
-            }
+            emitEvent(bestOpposite.getRequest().getClientId(), eventCounterparty);
             if (bestOpposite.getRemainingQuantity() == 0) {
                 oppositeQueue.poll();
                 book.getOrdersById().remove(bestOpposite.getId());
@@ -292,7 +283,11 @@ public final class Exchange implements MatchingEngine {
      * Предполагается вызывать, когда активных операций нет (после теста).
      */
     @Override
-    public ExchangeSnapshot snapshot() {
+    public Mono<ExchangeSnapshot> snapshot() {
+        return Mono.fromSupplier(this::buildSnapshot);
+    }
+
+    private ExchangeSnapshot buildSnapshot() {
         Map<CurrencyPair, OrderBookSnapshot> bookSnapshots = new HashMap<>();
 
         for (OrderBook book : books.values()) {
@@ -334,5 +329,9 @@ public final class Exchange implements MatchingEngine {
         }
 
         return new ExchangeSnapshot(bookSnapshots, tradesCopy);
+    }
+
+    private void emitEvent(String clientId, OrderEvent event) {
+        events.computeIfAbsent(clientId, id -> new ReactiveQueue<>()).emit(event);
     }
 }
