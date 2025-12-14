@@ -21,6 +21,11 @@
             <version>5.10.2</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>com.lmax</groupId>
+            <artifactId>disruptor</artifactId>
+            <version>4.0.0</version>
+        </dependency>
     </dependencies>
 
     <build>
@@ -39,7 +44,7 @@
     <repositories>
         <repository>
             <id>central-mirror</id>
-            <url>https://repo1.maven.org/maven2</url>
+            <url>https://repo.maven.apache.org/maven2</url>
             <releases>
                 <enabled>true</enabled>
             </releases>
@@ -52,7 +57,7 @@
     <pluginRepositories>
         <pluginRepository>
             <id>central-plugins</id>
-            <url>https://repo1.maven.org/maven2</url>
+            <url>https://repo.maven.apache.org/maven2</url>
             <releases>
                 <enabled>true</enabled>
             </releases>
